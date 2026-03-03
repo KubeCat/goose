@@ -401,7 +401,29 @@ async fn create_streamable_http_client(
     provider: SharedProvider,
     client_name: String,
     capabilities: GooseMcpClientCapabilities,
+    socket: Option<&str>,
 ) -> ExtensionResult<Box<dyn McpClientTrait>> {
+    #[cfg(unix)]
+    if let Some(socket_path) = socket {
+        return create_unix_socket_http_client(
+            uri,
+            timeout,
+            headers,
+            socket_path,
+            provider,
+            client_name,
+            capabilities,
+        )
+        .await;
+    }
+
+    #[cfg(not(unix))]
+    if socket.is_some() {
+        return Err(ExtensionError::ConfigError(
+            "Unix domain socket transport is not supported on this platform".to_string(),
+        ));
+    }
+
     let mut default_headers = HeaderMap::new();
 
     default_headers.insert(reqwest::header::USER_AGENT, GOOSE_USER_AGENT);
@@ -474,6 +496,54 @@ async fn create_streamable_http_client(
     } else {
         Ok(Box::new(client_res?))
     }
+}
+
+#[cfg(unix)]
+async fn create_unix_socket_http_client(
+    uri: &str,
+    timeout: Option<u64>,
+    headers: &HashMap<String, String>,
+    socket_path: &str,
+    provider: SharedProvider,
+    client_name: String,
+    capabilities: GooseMcpClientCapabilities,
+) -> ExtensionResult<Box<dyn McpClientTrait>> {
+    use super::unix_socket_http_client::UnixSocketHttpClient;
+    use http::header::HeaderValue;
+
+    let mut default_headers = std::collections::HashMap::new();
+    default_headers.insert(reqwest::header::USER_AGENT, GOOSE_USER_AGENT);
+    for (key, value) in headers {
+        let name = HeaderName::try_from(key)
+            .map_err(|_| ExtensionError::ConfigError(format!("invalid header: {key}")))?;
+        let val: HeaderValue = value
+            .parse()
+            .map_err(|_| ExtensionError::ConfigError(format!("invalid header value: {key}")))?;
+        default_headers.insert(name, val);
+    }
+
+    let unix_client = UnixSocketHttpClient::new(socket_path, default_headers);
+    let transport = StreamableHttpClientTransport::with_client(
+        unix_client,
+        StreamableHttpClientTransportConfig {
+            uri: uri.into(),
+            ..Default::default()
+        },
+    );
+
+    let timeout_duration =
+        Duration::from_secs(timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT));
+
+    Ok(Box::new(
+        McpClient::connect(
+            transport,
+            timeout_duration,
+            provider,
+            client_name,
+            capabilities,
+        )
+        .await?,
+    ))
 }
 
 impl ExtensionManager {
@@ -556,6 +626,7 @@ impl ExtensionManager {
                 name,
                 envs,
                 env_keys,
+                socket,
                 ..
             } => {
                 let config = Config::global();
@@ -576,6 +647,7 @@ impl ExtensionManager {
                     self.provider.clone(),
                     self.client_name.clone(),
                     capability,
+                    socket.as_deref(),
                 )
                 .await?
             }
